@@ -159,6 +159,7 @@ class BaseTaskService(Generic[T]):
                 task.status = TaskStatus.CANCELLED
                 task.finished_at = time.time()
                 self._append_log(task, "warning", f"task cancelled while pending: {reason}")
+                self._save_task_history_best_effort(task)
                 return task
 
             if task.status == TaskStatus.RUNNING:
@@ -240,6 +241,8 @@ class BaseTaskService(Generic[T]):
         finally:
             self._current_asyncio_task = None
             self._clear_cancel_hooks(task.id)
+            if task.status in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED) and task.finished_at:
+                self._save_task_history_best_effort(task)
 
     def _add_cancel_hook(self, task_id: str, hook: Callable[[], None]) -> None:
         """注册取消回调（线程安全）。"""
@@ -304,6 +307,14 @@ class BaseTaskService(Generic[T]):
             )
             if not any(message.startswith(x) for x in safe_messages):
                 raise TaskCancelledError(task.cancel_reason or "cancelled")
+
+    def _save_task_history_best_effort(self, task: T) -> None:
+        try:
+            from main import save_task_to_history
+            task_type = "login" if self._log_prefix == "REFRESH" else "register"
+            save_task_to_history(task_type, task.to_dict())
+        except Exception:
+            pass
 
     def _apply_accounts_update(self, accounts_data: list) -> None:
         """

@@ -32,6 +32,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.yaml")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+TASK_HISTORY_FILE = os.path.join(DATA_DIR, "task_history.json")
+TASK_HISTORY_TMP_FILE = os.path.join(DATA_DIR, "task_history.json.tmp")
+TASK_HISTORY_MTIME: float = 0.0
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
 VIDEO_DIR = os.path.join(DATA_DIR, "videos")
 
@@ -176,11 +179,85 @@ global_stats = {
     "recent_conversations": []
 }
 
+# 任务历史记录（内存存储，容器重启后清空）
+task_history = deque(maxlen=100)  # 最多保留100条历史记录
+task_history_lock = Lock()
+
 
 def get_beijing_time_str(ts: Optional[float] = None) -> str:
     tz = timezone(timedelta(hours=8))
     current = datetime.fromtimestamp(ts or time.time(), tz=tz)
     return current.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_task_to_history(task_type: str, task_data: dict) -> None:
+    """保存任务历史记录（只存储简要信息）"""
+    with task_history_lock:
+        history_entry = _build_history_entry(task_type, task_data)
+        entry_id = history_entry.get("id")
+        if entry_id:
+            for i in range(len(task_history) - 1, -1, -1):
+                if task_history[i].get("id") == entry_id:
+                    task_history.remove(task_history[i])
+                    break
+        task_history.append(history_entry)
+        _persist_task_history()
+        logger.info(f"[HISTORY] Saved {task_type} task to history: {history_entry['id']}")
+
+
+def _build_history_entry(task_type: str, task_data: dict, is_live: bool = False) -> dict:
+    total_value = task_data.get("count") if task_type == "register" else len(task_data.get("account_ids", []))
+    return {
+        "id": task_data.get("id", ""),
+        "type": task_type,  # "register" or "login"
+        "status": task_data.get("status", ""),
+        "progress": task_data.get("progress", 0),
+        "total": total_value,
+        "success_count": task_data.get("success_count", 0),
+        "fail_count": task_data.get("fail_count", 0),
+        "created_at": task_data.get("created_at", time.time()),
+        "finished_at": task_data.get("finished_at"),
+        "is_live": is_live,
+    }
+
+
+def _persist_task_history() -> None:
+    """Persist task history to disk (best-effort)."""
+    try:
+        history = list(task_history)
+        with open(TASK_HISTORY_TMP_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        os.replace(TASK_HISTORY_TMP_FILE, TASK_HISTORY_FILE)
+        global TASK_HISTORY_MTIME
+        try:
+            TASK_HISTORY_MTIME = os.path.getmtime(TASK_HISTORY_FILE)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning(f"[HISTORY] Persist failed: {exc}")
+
+
+def _load_task_history() -> None:
+    """Load persisted task history into memory (best-effort)."""
+    if not os.path.exists(TASK_HISTORY_FILE):
+        return
+    try:
+        global TASK_HISTORY_MTIME
+        mtime = os.path.getmtime(TASK_HISTORY_FILE)
+        if mtime <= TASK_HISTORY_MTIME:
+            return
+        with open(TASK_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return
+        with task_history_lock:
+            task_history.clear()
+            for item in data[-task_history.maxlen:]:
+                if isinstance(item, dict):
+                    task_history.append(item)
+        TASK_HISTORY_MTIME = mtime
+    except Exception as exc:
+        logger.warning(f"[HISTORY] Load failed: {exc}")
 
 
 def build_recent_conversation_entry(
@@ -268,6 +345,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("gemini")
+
+_load_task_history()
 
 # ---------- Linux zombie process reaper ----------
 # DrissionPage / Chromium may spawn subprocesses that exit without being waited on,
@@ -727,11 +806,11 @@ async def startup_event():
     elif storage.is_database_enabled():
         logger.info("[SYSTEM] 自动刷新账号功能已禁用（配置为0）")
 
-    # 启动自动登录刷新轮询
+    # 启动自动登录刷新轮询（始终启动，但默认禁用）
     if login_service:
         try:
             asyncio.create_task(login_service.start_polling())
-            logger.info("[SYSTEM] 账户过期检查轮询已启动（间隔: 30分钟）")
+            logger.info("[SYSTEM] 账户刷新轮询服务已启动（默认禁用，可在设置中启用）")
         except Exception as e:
             logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
     else:
@@ -1237,37 +1316,6 @@ async def admin_check_login_refresh(request: Request):
         return {"status": "idle"}
     return task.to_dict()
 
-@app.post("/admin/auto-refresh/pause")
-@require_login()
-async def admin_pause_auto_refresh(request: Request):
-    """暂停自动刷新（运行时开关，不保存到数据库）"""
-    if not login_service:
-        raise HTTPException(503, "login service unavailable")
-    login_service.pause_auto_refresh()
-    return {"status": "paused", "message": "Auto-refresh paused (runtime only)"}
-
-@app.post("/admin/auto-refresh/resume")
-@require_login()
-async def admin_resume_auto_refresh(request: Request):
-    """恢复自动刷新并立即执行一次检查"""
-    if not login_service:
-        raise HTTPException(503, "login service unavailable")
-    was_paused = login_service.resume_auto_refresh()
-    # 如果之前是暂停状态，立即执行一次检查
-    if was_paused:
-        asyncio.create_task(login_service.check_and_refresh())
-        return {"status": "active", "message": "Auto-refresh resumed and checking now"}
-    return {"status": "active", "message": "Auto-refresh resumed"}
-
-@app.get("/admin/auto-refresh/status")
-@require_login()
-async def admin_get_auto_refresh_status(request: Request):
-    """获取自动刷新状态"""
-    if not login_service:
-        raise HTTPException(503, "login service unavailable")
-    is_paused = login_service.is_auto_refresh_paused()
-    return {"paused": is_paused, "status": "paused" if is_paused else "active"}
-
 @app.delete("/admin/accounts/{account_id}")
 @require_login()
 async def admin_delete_account(request: Request, account_id: str):
@@ -1428,7 +1476,9 @@ async def admin_get_settings(request: Request):
             "account_failure_threshold": config.retry.account_failure_threshold,
             "rate_limit_cooldown_seconds": config.retry.rate_limit_cooldown_seconds,
             "session_cache_ttl_seconds": config.retry.session_cache_ttl_seconds,
-            "auto_refresh_accounts_seconds": config.retry.auto_refresh_accounts_seconds
+            "auto_refresh_accounts_seconds": config.retry.auto_refresh_accounts_seconds,
+            "scheduled_refresh_enabled": config.retry.scheduled_refresh_enabled,
+            "scheduled_refresh_interval_minutes": config.retry.scheduled_refresh_interval_minutes
         },
         "public_display": {
             "logo_url": config.public_display.logo_url,
@@ -1492,6 +1542,8 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
 
         retry = dict(new_settings.get("retry") or {})
         retry.setdefault("auto_refresh_accounts_seconds", config.retry.auto_refresh_accounts_seconds)
+        retry.setdefault("scheduled_refresh_enabled", config.retry.scheduled_refresh_enabled)
+        retry.setdefault("scheduled_refresh_interval_minutes", config.retry.scheduled_refresh_interval_minutes)
         new_settings["retry"] = retry
 
         # 保存旧配置用于对比
@@ -1668,6 +1720,63 @@ async def admin_clear_logs(request: Request, confirm: str = None):
         log_buffer.clear()
     logger.info("[LOG] 日志已清空")
     return {"status": "success", "message": "已清空内存日志", "cleared_count": cleared_count}
+
+@app.get("/admin/task-history")
+@require_login()
+async def admin_get_task_history(request: Request, limit: int = 100):
+    """获取任务历史记录"""
+    _load_task_history()
+    with task_history_lock:
+        history = list(task_history)
+
+    live_entries = []
+    try:
+        if register_service:
+            current_register = register_service.get_current_task()
+            if current_register:
+                live_entries.append(_build_history_entry("register", current_register.to_dict(), is_live=True))
+        if login_service:
+            current_login = login_service.get_current_task()
+            if current_login:
+                live_entries.append(_build_history_entry("login", current_login.to_dict(), is_live=True))
+    except Exception as exc:
+        logger.warning(f"[HISTORY] build live entries failed: {exc}")
+
+    merged = {}
+    for entry in live_entries + history:
+        entry_id = entry.get("id") or str(uuid.uuid4())
+        if entry_id not in merged:
+            merged[entry_id] = entry
+
+    # 按创建时间倒序排序
+    history = list(merged.values())
+    history.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+
+    # 限制返回数量
+    limit = min(limit, 100)
+    return {
+        "total": len(history),
+        "limit": limit,
+        "history": history[:limit]
+    }
+
+@app.delete("/admin/task-history")
+@require_login()
+async def admin_clear_task_history(request: Request, confirm: str = None):
+    """清空任务历史记录"""
+    if confirm != "yes":
+        raise HTTPException(400, "需要 confirm=yes 参数确认清空操作")
+    with task_history_lock:
+        cleared_count = len(task_history)
+        task_history.clear()
+        _persist_task_history()
+        try:
+            if os.path.exists(TASK_HISTORY_FILE):
+                os.remove(TASK_HISTORY_FILE)
+        except Exception as exc:
+            logger.warning(f"[HISTORY] 删除历史文件失败: {exc}")
+    logger.info("[HISTORY] 任务历史已清空")
+    return {"status": "success", "message": "已清空任务历史", "cleared_count": cleared_count}
 
 # ---------- Auth endpoints (API) ----------
 

@@ -101,6 +101,9 @@ class RetryConfig(BaseModel):
     rate_limit_cooldown_seconds: int = Field(default=3600, ge=3600, le=43200, description="429冷却时间（秒）")
     session_cache_ttl_seconds: int = Field(default=3600, ge=0, le=86400, description="会话缓存时间（秒，0表示禁用缓存）")
     auto_refresh_accounts_seconds: int = Field(default=60, ge=0, le=600, description="自动刷新账号间隔（秒，0禁用）")
+    # 定时刷新配置
+    scheduled_refresh_enabled: bool = Field(default=False, description="是否启用定时刷新任务")
+    scheduled_refresh_interval_minutes: int = Field(default=30, ge=0, le=720, description="定时刷新检测间隔（分钟，0-12小时）")
 
 
 class PublicDisplayConfig(BaseModel):
